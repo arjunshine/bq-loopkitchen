@@ -1,0 +1,89 @@
+#firstload
+CREATE TABLE loop-374407.Loop.ubereats AS (
+  SELECT * FROM arboreal-vision-339901.take_home_v2.virtual_kitchen_ubereats_hours
+);
+CREATE TABLE loop-374407.Loop.grubhub AS (
+  SELECT * FROM arboreal-vision-339901.take_home_v2.virtual_kitchen_grubhub_hours
+);
+#grubhub
+CREATE TABLE loop-374407.Loop.gh_df AS (
+  SELECT b.slug, b.response,b.vb_name,b.timestamp,b.b_name,b.vb_platform,b.vb_address,b.token,
+  PARSE_TIME("%H:%M", REGEXP_REPLACE(JSON_VALUE(b.response,'$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules[1].from'), r':00\.000', '')) as startTime,
+  PARSE_TIME("%H:%M", REGEXP_REPLACE(JSON_VALUE(b.response,'$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules[1].to'), r':00\.000', '')) as endTime
+  FROM `loop-374407.Loop.grubhub` b
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY b.vb_name ORDER BY b.timestamp DESC) = 1
+  AND JSON_VALUE(b.response,'$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules[1].from') IS NOT NULL
+  AND JSON_VALUE(b.response,'$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules[1].to') IS NOT NULL
+);
+#ubereats#load
+CREATE TABLE loop-374407.Loop.ub_rank AS (
+  with summary as ( SELECT a.vb_name,a.timestamp,a.response,a.slug,a.b_name,a.vb_platform,a.vb_address,a.token, ROW_NUMBER() OVER(PARTITION BY a.vb_name ORDER BY a.timestamp DESC) AS rank FROM `loop-374407.Loop.ubereats` a) SELECT * FROM SUMMARY WHERE rank =1);
+ALTER TABLE `loop-374407.Loop.ub_rank` DROP COLUMN rank;
+#extract
+CREATE OR REPLACE FUNCTION Loop.jsonObject(jsonObj STRING, type STRING)
+RETURNS STRING
+LANGUAGE js AS """
+let keys = Object.keys(JSON.parse(jsonObj).data.menus);
+if (type == 'start') {
+    return JSON.parse(jsonObj).data.menus[keys[0]].sections[0].regularHours[0].startTime +':00';
+} else if (type == 'end') {
+    return JSON.parse(jsonObj).data.menus[keys[0]].sections[0].regularHours[0].endTime +':00';
+}
+""";
+CREATE TABLE loop-374407.Loop.ub_df AS
+SELECT DISTINCT vb_name,timestamp,slug,b_name,vb_platform,vb_address,token,startTime,endTime
+FROM (
+SELECT
+vb_name,timestamp,slug,b_name,vb_platform,vb_address,token,
+Loop.jsonObject(TO_JSON_STRING(response), 'start') AS startTime,
+Loop.jsonObject(TO_JSON_STRING(response), 'end') AS endTime
+FROM
+loop-374407.Loop.ub_rank
+WHERE JSON_EXTRACT(response,'$.data.menus') IS NOT NULL
+)
+ORDER BY startTime, endTime;
+#DELETING TABLES
+DROP TABLE `loop-374407.Loop.ub_rank`;
+DROP TABLE `loop-374407.Loop.ubereats`;
+DROP TABLE `loop-374407.Loop.grubhub`;
+#totalcomb
+CREATE TABLE loop-374407.Loop.expected_output AS (
+WITH cte AS (
+  SELECT a.b_name, a.vb_name, 
+    CAST(a.startTime AS TIME) as Ub_start,
+    CAST(a.endTime AS TIME) as Ub_end,
+    CAST(b.startTime AS TIME) as gh_start,
+    CAST(b.endTime AS TIME) as gh_end,
+    TIME_DIFF(
+      CAST(a.startTime AS TIME),
+      CAST(b.startTime AS TIME),
+      MINUTE
+    ) + TIME_DIFF(
+      CAST(a.endTime AS TIME),
+      CAST(b.endTime AS TIME),
+      MINUTE
+    ) AS diff
+  FROM `loop-374407.Loop.ub_df` a 
+  JOIN `loop-374407.Loop.gh_df` b 
+  ON a.b_name = b.b_name AND a.vb_name = b.vb_name
+)
+SELECT b.slug as Grubhub_slug,CONCAT(b.startTime,' to ',b.endTime) AS Virtual_restaurant_business_hours,
+ a.slug as Ubereats_slug, CONCAT(a.startTime,' to ',a.endTime) AS Uber_eats_business_hours,
+  CASE 
+    WHEN cte.diff < 5 THEN 'In Range'
+    WHEN cte.diff < 10 THEN 'Out of Range with 5 mins difference between GH and UE'
+    ELSE 'Out of Range'
+  END AS is_out_range  
+FROM `loop-374407.Loop.ub_df` a
+JOIN `loop-374407.Loop.gh_df` b 
+ON a.b_name = b.b_name AND a.vb_name = b.vb_name
+JOIN cte ON a.b_name = cte.b_name AND a.vb_name = cte.vb_name
+);
+SELECT * FROM `loop-374407.Loop.expected_output` ;
+
+#DELETING TABLES
+#DROP TABLE `loop-374407.Loop.gh_df`;
+#DROP TABLE `loop-374407.Loop.ub_df`;
+#DROP TABLE `loop-374407.Loop.expected_output`;
+
+#SELECT * FROM `loop-374407.Loop.gh_df` where slug ='thefrenchtoastf_princedelimarke_gh'
